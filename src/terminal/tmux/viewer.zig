@@ -1065,7 +1065,9 @@ pub const Viewer = struct {
                 Format.pane_titles.delim,
             ) catch continue;
 
-            _ = self.panes.getPtr(data.pane_id) orelse continue;
+            const pane = self.panes.getPtr(data.pane_id) orelse continue;
+            if (pane.current_command.len > 0) self.alloc.free(pane.current_command);
+            pane.current_command = self.alloc.dupe(u8, data.pane_current_command) catch &.{};
 
             const fallback_name = fallback: {
                 for (self.windows.items) |window| {
@@ -1110,6 +1112,10 @@ pub const Viewer = struct {
             // Determine which screen to use based on alternate_on
             const screen_key: ScreenSet.Key = if (data.alternate_on) .alternate else .primary;
             const needs_redraw = !pane.initialized and data.alternate_on;
+
+            // Store the per-pane command for title display
+            if (pane.current_command.len > 0) self.alloc.free(pane.current_command);
+            pane.current_command = self.alloc.dupe(u8, data.pane_current_command) catch &.{};
 
             // Set cursor position on the appropriate screen (tmux uses 0-based)
             if (t.screens.get(screen_key)) |screen| {
@@ -1696,6 +1702,8 @@ const Format = struct {
             .scroll_region_lower,
             // Tab stops
             .pane_tabs,
+            // Running command (for per-pane titles)
+            .pane_current_command,
         },
     };
 
@@ -1703,6 +1711,7 @@ const Format = struct {
         .delim = ';',
         .vars = &.{
             .pane_id,
+            .pane_current_command,
         },
     };
 
@@ -2280,7 +2289,7 @@ test "initial alternate pane queues redraw after pane state" {
         .{ .input = .{ .tmux = .{ .block_end = "" } }, .contains_command = "list-panes" },
         .{
             .input = .{ .tmux = .{
-                .block_end = "%0;0;0;1;block;;1;1;0;0;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;",
+                .block_end = "%0;0;0;1;block;;1;1;0;0;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;;vim",
             } },
             .contains_command = "send-keys",
             .check_command = (struct {
@@ -2354,8 +2363,8 @@ test "initial alternate panes across windows queue redraws" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\%0;0;0;1;block;;1;1;0;0;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;
-                \\%1;0;0;1;block;;1;1;0;0;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;
+                \\%0;0;0;1;block;;1;1;0;0;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;;vim
+                \\%1;0;0;1;block;;1;1;0;0;0;1;0;0;0;0;0;0;0;0;0;0;0;0;43;;htop
                 ,
             } },
             .contains_command = "send-keys",
@@ -2788,8 +2797,8 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\%0;42;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;39;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
-                \\%4;10;5;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;37;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160
+                \\%0;42;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;39;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160;zsh
+                \\%4;10;5;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;37;8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160;bash
                 ,
             } },
             .check = (struct {

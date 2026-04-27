@@ -145,6 +145,8 @@ pub const Variable = enum {
     origin_flag,
     /// Unique pane ID prefixed with `%` (e.g., `%0`, `%42`).
     pane_id,
+    /// The command running in the pane (e.g., `zsh`, `vim`).
+    pane_current_command,
     /// Pane tab positions as a comma-separated list of 0-indexed column
     /// numbers (e.g., `8,16,24,32`). Empty string if no tabs are set.
     pane_tabs,
@@ -216,6 +218,7 @@ pub const Variable = enum {
             .window_height => try std.fmt.parseInt(usize, value, 10),
             .cursor_colour,
             .cursor_shape,
+            .pane_current_command,
             .pane_tabs,
             .version,
             .window_layout,
@@ -258,6 +261,7 @@ pub const Variable = enum {
             => usize,
             .cursor_colour,
             .cursor_shape,
+            .pane_current_command,
             .pane_tabs,
             .version,
             .window_layout,

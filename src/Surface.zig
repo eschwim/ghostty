@@ -788,6 +788,8 @@ pub fn init(
                     pane.terminal.cols,
                     pane.terminal.rows,
                 });
+
+                self.io.skip_next_rendered_resize = true;
             }
         }
     }

@@ -56,6 +56,10 @@ surface_mailbox: apprt.surface.Mailbox,
 /// The cached size info
 size: renderer.Size,
 
+/// Skip one rendered-terminal resize for tmux pane surfaces so the
+/// initial 800x600 default doesn't overwrite initLayout dimensions.
+skip_next_rendered_resize: bool = false,
+
 /// The mailbox implementation to use.
 mailbox: termio.Mailbox,
 
@@ -489,13 +493,17 @@ pub fn resize(
         // If the rendered terminal is different from our own (e.g.,
         // tmux pane terminal), resize it too under the same mutex.
         if (self.renderer_state.terminal != &self.terminal) {
-            self.renderer_state.terminal.resize(
-                self.alloc,
-                grid_size.columns,
-                grid_size.rows,
-            ) catch |err| {
-                log.warn("failed to resize rendered terminal: {}", .{err});
-            };
+            if (self.skip_next_rendered_resize) {
+                self.skip_next_rendered_resize = false;
+            } else {
+                self.renderer_state.terminal.resize(
+                    self.alloc,
+                    grid_size.columns,
+                    grid_size.rows,
+                ) catch |err| {
+                    log.warn("failed to resize rendered terminal: {}", .{err});
+                };
+            }
         }
 
         // Update our pixel sizes
