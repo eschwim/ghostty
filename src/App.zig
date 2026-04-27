@@ -15,6 +15,8 @@ const Config = configpkg.Config;
 const BlockingQueue = @import("datastruct/main.zig").BlockingQueue;
 const renderer = @import("renderer.zig");
 const font = @import("font/main.zig");
+const terminal = @import("terminal/main.zig");
+const termio = @import("termio.zig");
 
 const log = std.log.scoped(.app);
 
@@ -64,10 +66,28 @@ last_notification_digest: u64 = 0,
 /// to the app-level config and as a default for new surfaces.
 config_conditional_state: configpkg.ConditionalState,
 
+/// When set, the next surface created will use the tmux backend
+/// with this configuration instead of the exec backend. This is
+/// consumed (set to null) by Surface.init on the main thread.
+pending_tmux_surface: if (terminal.options.tmux_control_mode) ?PendingTmuxSurface else void =
+    if (terminal.options.tmux_control_mode) null else {},
+
+/// The split ratio to use when creating the next split. Set by
+/// handleTmuxWindowsChanged before performAction(.new_split) and
+/// consumed by the apprt. Defaults to 0.5 (equal split).
+pending_split_ratio: f64 = 0.5,
+
 /// Set to false once we've created at least one surface. This
 /// never goes true again. This can be used by surfaces to determine
 /// if they are the first surface.
 first: bool = true,
+
+pub const PendingTmuxSurface = if (terminal.options.tmux_control_mode) struct {
+    pane_id: usize,
+    control_mailbox: *termio.Mailbox,
+    viewer: *terminal.tmux.Viewer,
+    control_surface: *Surface,
+} else void;
 
 pub const CreateError = Allocator.Error || font.SharedGridSet.InitError;
 
@@ -266,7 +286,7 @@ fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
 
 pub fn closeSurface(self: *App, surface: *Surface) void {
     if (!self.hasSurface(surface)) return;
-    surface.close();
+    _ = surface.requestClose();
 }
 
 pub fn focusSurface(self: *App, surface: *Surface) void {

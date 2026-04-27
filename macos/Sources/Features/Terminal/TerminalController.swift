@@ -676,6 +676,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             return
         }
 
+        if requestDeferredCloseForTmuxControlSurface() {
+            return
+        }
+
         cancelPendingInitialPresentation()
 
         // Undo
@@ -700,6 +704,17 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         window.close()
+    }
+
+    private func requestDeferredCloseForTmuxControlSurface() -> Bool {
+        guard let leaves = surfaceTree.root?.leaves() else { return false }
+        for leaf in leaves {
+            guard let surface = leaf.surface else { continue }
+            if ghostty_surface_request_close_deferred(surface) {
+                return true
+            }
+        }
+        return false
     }
 
     private func closeOtherTabsImmediately() {
@@ -1246,6 +1261,18 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     // Called when the window will be encoded. We handle the data encoding here in the
     // window controller.
     func window(_ window: NSWindow, willEncodeRestorableState state: NSCoder) {
+        // Don't save state for windows containing tmux panes — they're
+        // controlled by tmux and shouldn't be recreated on restart.
+        if let leaves = surfaceTree.root?.leaves() {
+            for leaf in leaves {
+                if let surface = leaf.surface {
+                    if ghostty_surface_is_tmux(surface) {
+                        return
+                    }
+                }
+            }
+        }
+
         let data = TerminalRestorableState(from: self)
         data.encode(with: state)
     }

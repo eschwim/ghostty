@@ -309,6 +309,9 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .terminal_stream = .initAlloc(alloc, handler),
         .thread_enter_state = thread_enter_state,
     };
+
+    // Give the stream handler a reference to the parser for raw passthrough
+    self.terminal_stream.handler.parser = &self.terminal_stream.parser;
 }
 
 pub fn deinit(self: *Termio) void {
@@ -482,6 +485,18 @@ pub fn resize(
             grid_size.columns,
             grid_size.rows,
         );
+
+        // If the rendered terminal is different from our own (e.g.,
+        // tmux pane terminal), resize it too under the same mutex.
+        if (self.renderer_state.terminal != &self.terminal) {
+            self.renderer_state.terminal.resize(
+                self.alloc,
+                grid_size.columns,
+                grid_size.rows,
+            ) catch |err| {
+                log.warn("failed to resize rendered terminal: {}", .{err});
+            };
+        }
 
         // Update our pixel sizes
         self.terminal.width_px = grid_size.columns * self.size.cell.width;

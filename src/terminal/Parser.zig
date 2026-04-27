@@ -6,7 +6,9 @@ const Parser = @This();
 
 const std = @import("std");
 const testing = std.testing;
-const table = @import("parse_table.zig").table;
+const parse_table = @import("parse_table.zig");
+const table = parse_table.table;
+const Transition = parse_table.Transition;
 const osc = @import("osc.zig");
 
 const log = std.log.scoped(.parser);
@@ -205,6 +207,11 @@ pub const MAX_PARAMS = 24;
 /// Current state of the state machine
 state: State,
 
+/// When true, ESC bytes in dcs_passthrough are treated as data (put)
+/// instead of triggering a state transition. The tmux control parser
+/// handles ST detection (ESC \) internally.
+raw_passthrough: bool = false,
+
 /// Intermediate tracking.
 intermediates: [MAX_INTERMEDIATE]u8,
 intermediates_idx: u8,
@@ -249,7 +256,19 @@ pub fn deinit(self: *Parser) void {
 /// Up to 3 actions may need to be executed -- in order -- representing
 /// the state exit, transition, and entry actions.
 pub fn next(self: *Parser, c: u8) [3]?Action {
-    const effect = table[c][@intFromEnum(self.state)];
+    const effect = effect: {
+        const e = table[c][@intFromEnum(self.state)];
+
+        // In raw passthrough mode (tmux control mode), force ALL bytes
+        // to be put actions. Without this, bytes > 0x7E that aren't in
+        // the explicit put range (0x00-0x7E) get .none action and are
+        // silently dropped, corrupting UTF-8 sequences in the payload.
+        if (self.raw_passthrough and self.state == .dcs_passthrough) {
+            break :effect Transition{ .state = .dcs_passthrough, .action = .put };
+        }
+
+        break :effect e;
+    };
 
     // log.info("next: {x}", .{c});
 

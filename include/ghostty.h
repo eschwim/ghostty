@@ -1093,6 +1093,7 @@ GHOSTTY_API void ghostty_app_keyboard_changed(ghostty_app_t);
 GHOSTTY_API void ghostty_app_open_config(ghostty_app_t);
 GHOSTTY_API void ghostty_app_update_config(ghostty_app_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_app_needs_confirm_quit(ghostty_app_t);
+GHOSTTY_API double ghostty_app_pending_split_ratio(ghostty_app_t);
 GHOSTTY_API bool ghostty_app_has_global_keybinds(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_color_scheme(ghostty_app_t, ghostty_color_scheme_e);
 
@@ -1107,12 +1108,14 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_su
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_is_tmux(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+GHOSTTY_API void ghostty_surface_set_size_drag(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
@@ -1142,6 +1145,7 @@ GHOSTTY_API void ghostty_surface_mouse_scroll(ghostty_surface_t,
 GHOSTTY_API void ghostty_surface_mouse_pressure(ghostty_surface_t, uint32_t, double);
 GHOSTTY_API void ghostty_surface_ime_point(ghostty_surface_t, double*, double*, double*, double*);
 GHOSTTY_API void ghostty_surface_request_close(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_request_close_deferred(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_split(ghostty_surface_t, ghostty_action_split_direction_e);
 GHOSTTY_API void ghostty_surface_split_focus(ghostty_surface_t,
                                                 ghostty_action_goto_split_e);

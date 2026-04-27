@@ -73,6 +73,15 @@ pub const StreamHandler = struct {
     /// The tmux control mode viewer state.
     tmux_viewer: if (tmux_enabled) ?*terminal.tmux.Viewer else void = if (tmux_enabled) null else {},
 
+    /// Info for each tmux pane surface, used to wake renderers on
+    /// %output and restore terminal pointers on tmux exit.
+    tmux_panes: if (tmux_enabled) std.ArrayListUnmanaged(TmuxPaneInfo) else void =
+        if (tmux_enabled) .empty else {},
+
+    /// Pointer to the parser, set after Termio.init. Used to enable
+    /// raw passthrough mode for tmux control mode.
+    parser: ?*terminal.Parser = null,
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
@@ -87,14 +96,23 @@ pub const StreamHandler = struct {
     /// True if we have tmux control mode built in.
     pub const tmux_enabled = terminal.options.tmux_control_mode;
 
+    pub const TmuxPaneInfo = struct {
+        renderer_wakeup: xev.Async,
+        renderer_state: *renderer.State,
+        terminal: *terminal.Terminal,
+        backend: *termio.Tmux,
+    };
+
     pub fn deinit(self: *StreamHandler) void {
         self.apc.deinit();
         self.dcs.deinit();
-        if (comptime tmux_enabled) tmux: {
-            const viewer = self.tmux_viewer orelse break :tmux;
-            viewer.deinit();
-            self.alloc.destroy(viewer);
-            self.tmux_viewer = null;
+        if (comptime tmux_enabled) {
+            self.tmux_panes.deinit(self.alloc);
+            if (self.tmux_viewer) |viewer| {
+                viewer.deinit();
+                self.alloc.destroy(viewer);
+                self.tmux_viewer = null;
+            }
         }
     }
 
@@ -368,6 +386,13 @@ pub const StreamHandler = struct {
     pub inline fn dcsHook(self: *StreamHandler, dcs: terminal.DCS) !void {
         var cmd = self.dcs.hook(self.alloc, dcs) orelse return;
         defer cmd.deinit();
+
+        // Enable raw passthrough for tmux control mode so that ESC
+        // bytes in capture-pane output don't terminate the DCS.
+        if (cmd == .tmux and cmd.tmux == .enter) {
+            if (self.parser) |p| p.raw_passthrough = true;
+        }
+
         try self.dcsCommand(&cmd);
     }
 
@@ -394,8 +419,13 @@ pub const StreamHandler = struct {
 
                 switch (tmux) {
                     .enter => {
-                        // Setup our viewer state
-                        assert(self.tmux_viewer == null);
+                        // If a previous viewer exists (e.g. tmux reconnection),
+                        // free it before creating the new one.
+                        if (self.tmux_viewer) |old_viewer| {
+                            old_viewer.deinit();
+                            self.alloc.destroy(old_viewer);
+                            self.tmux_viewer = null;
+                        }
                         const viewer = try self.alloc.create(terminal.tmux.Viewer);
                         errdefer self.alloc.destroy(viewer);
                         viewer.* = try .init(self.alloc);
@@ -405,11 +435,54 @@ pub const StreamHandler = struct {
                     },
 
                     .exit => {
-                        // Free our viewer state if we have one
-                        if (self.tmux_viewer) |viewer| {
-                            viewer.deinit();
-                            self.alloc.destroy(viewer);
-                            self.tmux_viewer = null;
+                        if (self.tmux_viewer) |_| {
+                            // Reset the VT parser: disable raw passthrough
+                            // and return to ground state so the parser stops
+                            // treating all bytes as DCS payload.
+                            if (self.parser) |p| {
+                                p.raw_passthrough = false;
+                                p.state = .ground;
+                            }
+                            // Reset the DCS handler state
+                            self.dcs.discard();
+                            self.dcs.state = .inactive;
+
+                            // Restore renderer terminals before the pane
+                            // surface is closed.
+                            self.renderer_state.terminal = self.terminal;
+                            if (comptime tmux_enabled) {
+                                for (self.tmux_panes.items) |*info| {
+                                    info.renderer_state.terminal = info.terminal;
+                                    info.backend.active = false;
+                                }
+                                self.tmux_panes.clearRetainingCapacity();
+                            }
+
+                            // Null the viewer's pane references to surface
+                            // state that will be destroyed when pane surfaces
+                            // close. Without this, Pane.deinit would try to
+                            // lock freed mutexes if the viewer is freed later
+                            // (by a subsequent .enter or StreamHandler.deinit).
+                            if (comptime tmux_enabled) {
+                                var pane_iter = self.tmux_viewer.?.panes.iterator();
+                                while (pane_iter.next()) |entry| {
+                                    const pane = entry.value_ptr;
+                                    pane.renderer_mutex = null;
+                                    pane.renderer_state = null;
+                                    pane.fallback_terminal = null;
+                                }
+                            }
+
+                            // Keep tmux_viewer alive — pane surfaces still
+                            // hold a pointer to it (accessed on the app
+                            // thread in deinit and sizeCallback). It will
+                            // be freed by StreamHandler.deinit when the
+                            // control surface is destroyed, or by a
+                            // subsequent .enter if tmux reconnects.
+
+                            // Notify the surface to close pane tabs and
+                            // clean up controllers.
+                            self.surfaceMessageWriter(.{ .tmux_exited = {} });
                         }
 
                         // And always break since we assert below
@@ -453,9 +526,32 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .windows => {
-                            // TODO
+                        .windows => |windows| {
+                            _ = windows;
+                            self.surfaceMessageWriter(.{ .tmux_windows_changed = {} });
                         },
+
+                        .title => |info| {
+                            var title_buf: [256]u8 = .{0} ** 256;
+                            const len = @min(info.name.len, title_buf.len);
+                            @memcpy(title_buf[0..len], info.name[0..len]);
+                            self.surfaceMessageWriter(.{
+                                .tmux_title_changed = .{
+                                    .pane_id = info.pane_id,
+                                    .title = title_buf,
+                                },
+                            });
+                        },
+                    }
+                }
+
+                // Wake all tmux pane surface renderers so they pick up
+                // any terminal updates from %output processing.
+                if (comptime tmux_enabled) {
+                    for (self.tmux_panes.items) |info| {
+                        info.renderer_wakeup.notify() catch |err| {
+                            log.warn("tmux: failed to wake pane renderer err={}", .{err});
+                        };
                     }
                 }
             },

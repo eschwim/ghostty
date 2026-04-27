@@ -176,6 +176,27 @@ search: ?Search = null,
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.time.Instant = null,
 
+/// Tmux control mode controller. Created when this surface enters
+/// tmux control mode and destroyed when it exits.
+tmux_controller: if (termio.StreamHandler.tmux_enabled) ?terminal.tmux.Controller else void =
+    if (termio.StreamHandler.tmux_enabled) null else {},
+
+/// References to tmux pane surfaces created by this control surface.
+/// Keyed by pane ID. Used to close pane tabs when tmux exits.
+tmux_pane_surfaces: if (termio.StreamHandler.tmux_enabled)
+    std.AutoArrayHashMapUnmanaged(usize, *Surface)
+else
+    void = if (termio.StreamHandler.tmux_enabled) .empty else {},
+
+/// For tmux pane surfaces: pointer to the control surface that owns us.
+/// Used to clean up tmux_pane_surfaces on deinit.
+tmux_control_surface: if (termio.StreamHandler.tmux_enabled) ?*Surface else void =
+    if (termio.StreamHandler.tmux_enabled) null else {},
+
+/// True when closing a tmux control surface has requested a graceful detach.
+tmux_detach_requested: if (termio.StreamHandler.tmux_enabled) bool else void =
+    if (termio.StreamHandler.tmux_enabled) false else {},
+
 /// The effect of an input event. This can be used by callers to take
 /// the appropriate action after an input event. For example, key
 /// input can be forwarded to the OS for further processing if it
@@ -636,49 +657,89 @@ pub fn init(
     // Start our IO implementation
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
+    // Captured reference to control surface's stream handler for
+    // post-init tmux registration.
+    var tmux_control_handler: ?*termio.StreamHandler = null;
+    var tmux_control_mutex: ?*std.Thread.Mutex = null;
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
-        };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        var buf: [18]u8 = undefined;
-        try env.put(
-            "GHOSTTY_SURFACE_ID",
-            std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-        );
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
-
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
+
+        // Check if this surface should use the tmux backend
+        const backend: termio.Backend = backend: {
+            if (comptime termio.StreamHandler.tmux_enabled) {
+                if (app.pending_tmux_surface) |tmux_config| {
+                    app.pending_tmux_surface = null;
+                    log.info("tmux: creating surface for pane %{d}", .{tmux_config.pane_id});
+
+                    // Set up the tmux controller on this surface
+                    self.tmux_controller = .init(alloc, tmux_config.viewer);
+
+                    // Store control handler ref for post-init registration
+                    tmux_control_handler = &tmux_config.control_surface.io.terminal_stream.handler;
+                    tmux_control_mutex = tmux_config.control_surface.renderer_state.mutex;
+
+                    // Register ourselves with the control surface so it
+                    // can close us when tmux exits.
+                    tmux_config.control_surface.tmux_pane_surfaces.put(
+                        alloc,
+                        tmux_config.pane_id,
+                        self,
+                    ) catch |err| {
+                        log.warn("tmux: failed to register pane surface err={}", .{err});
+                    };
+                    errdefer _ = tmux_config.control_surface.tmux_pane_surfaces.swapRemove(tmux_config.pane_id);
+                    self.tmux_control_surface = tmux_config.control_surface;
+
+                    break :backend .{ .tmux = .init(alloc, .{
+                        .pane_id = tmux_config.pane_id,
+                        .control_mailbox = tmux_config.control_mailbox,
+                        .viewer = tmux_config.viewer,
+                        .control_mutex = tmux_config.control_surface.renderer_state.mutex,
+                    }) };
+                }
+            }
+
+            // Normal exec backend
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env internal_os.getEnvMap(alloc) catch
+                    std.process.EnvMap.init(alloc);
+            };
+            errdefer env.deinit();
+
+            env.remove("GHOSTTY_LOG");
+
+            var buf: [18]u8 = undefined;
+            try env.put(
+                "GHOSTTY_SURFACE_ID",
+                std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+            );
+
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+
+            break :backend .{ .exec = io_exec };
+        };
 
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -689,6 +750,47 @@ pub fn init(
     // Outside the block, IO has now taken ownership of our temporary state
     // so we can just defer this and not the subcomponents.
     errdefer self.io.deinit();
+
+    // Complete tmux registration now that Termio is initialized.
+    // Lock the control surface's renderer mutex since the IO thread
+    // iterates tmux_panes under the same mutex during processOutput.
+    if (comptime termio.StreamHandler.tmux_enabled) {
+        if (tmux_control_handler) |handler| {
+            if (tmux_control_mutex) |ctrl_mutex| ctrl_mutex.lock();
+            defer if (tmux_control_mutex) |ctrl_mutex| ctrl_mutex.unlock();
+            handler.tmux_panes.append(self.alloc, .{
+                .renderer_wakeup = render_thread.wakeup,
+                .renderer_state = &self.renderer_state,
+                .terminal = &self.io.terminal,
+                .backend = &self.io.backend.tmux,
+            }) catch |err| {
+                log.warn("tmux: failed to register pane handler err={}", .{err});
+            };
+        }
+    }
+
+    // If this surface uses the tmux backend, swap the renderer terminal
+    // to the tmux pane's terminal BEFORE starting threads (no race).
+    if (comptime termio.StreamHandler.tmux_enabled) {
+        if (self.io.backend == .tmux) {
+            const tmux = &self.io.backend.tmux;
+            if (tmux.viewer.panes.getPtr(tmux.pane_id)) |pane| {
+                self.renderer_state.terminal = pane.terminal;
+                pane.renderer_mutex = self.renderer_state.mutex;
+                pane.renderer_state = &self.renderer_state;
+                pane.fallback_terminal = &self.io.terminal;
+
+                // Copy configured colors to the pane terminal so it
+                // matches the user's color scheme.
+                pane.terminal.colors = self.io.terminal.colors;
+                log.info("tmux: surface rendering pane %{d} ({d}x{d})", .{
+                    tmux.pane_id,
+                    pane.terminal.cols,
+                    pane.terminal.rows,
+                });
+            }
+        }
+    }
 
     // Report initial cell size on surface creation
     _ = try rt_app.performAction(
@@ -829,6 +931,42 @@ pub fn deinit(self: *Surface) void {
         self.alloc.destroy(v);
     }
 
+    // Clean up tmux controller and pane surface tracking
+    if (comptime termio.StreamHandler.tmux_enabled) {
+        if (self.tmux_controller) |*c| c.deinit();
+        self.tmux_pane_surfaces.deinit(self.alloc);
+
+        // If this is a tmux pane surface, remove ourselves from the
+        // control surface's tracking map to prevent stale pointers.
+        if (self.io.backend == .tmux) {
+            const tmux = &self.io.backend.tmux;
+
+            // Clear the pane's references to our renderer state since
+            // we're about to destroy them. Only safe when the backend
+            // is still active — after tmux exit, the viewer may already
+            // be freed by the control surface's StreamHandler.deinit.
+            if (comptime termio.StreamHandler.tmux_enabled) {
+                if (tmux.active) {
+                    if (tmux.viewer.panes.getPtr(tmux.pane_id)) |pane| {
+                        pane.renderer_mutex = null;
+                        pane.renderer_state = null;
+                        pane.fallback_terminal = null;
+                    }
+                }
+            }
+
+            if (self.tmux_control_surface) |ctrl| {
+                _ = ctrl.tmux_pane_surfaces.swapRemove(tmux.pane_id);
+            }
+            // Tell tmux to close this pane's window
+            if (tmux.active) {
+                var buf: [64]u8 = undefined;
+                const cmd = std.fmt.bufPrint(&buf, "kill-pane -t %{d}\n", .{tmux.pane_id}) catch "";
+                if (cmd.len > 0) tmux.queueTmuxCommand(cmd);
+            }
+        }
+    }
+
     // Clean up our keyboard state
     for (self.keyboard.sequence_queued.items) |req| req.deinit();
     self.keyboard.sequence_queued.deinit(self.alloc);
@@ -849,6 +987,42 @@ pub fn deinit(self: *Surface) void {
 /// close process, which should ultimately deinitialize this surface.
 pub fn close(self: *Surface) void {
     self.rt_surface.close(self.needsConfirmQuit());
+}
+
+/// Request that this surface closes. Returns true if the request was
+/// handled internally and callers should not directly destroy the surface.
+pub fn requestClose(self: *Surface) bool {
+    if (comptime termio.StreamHandler.tmux_enabled) {
+        if (self.requestCloseDeferred()) return true;
+    }
+
+    self.close();
+    return false;
+}
+
+/// Request only close flows that must be deferred. Returns true if the
+/// caller should not immediately destroy the surface.
+pub fn requestCloseDeferred(self: *Surface) bool {
+    if (comptime termio.StreamHandler.tmux_enabled) {
+        return self.requestTmuxDetachOnClose();
+    }
+
+    return false;
+}
+
+/// If this is an active tmux control surface, detach control mode and wait
+/// for the tmux_exited path to clean up pane tabs before closing us.
+fn requestTmuxDetachOnClose(self: *Surface) bool {
+    if (comptime !termio.StreamHandler.tmux_enabled) return false;
+    if (self.io.backend != .exec) return false;
+    if (self.tmux_controller == null) return false;
+    if (self.tmux_pane_surfaces.count() == 0) return false;
+
+    if (!self.tmux_detach_requested) {
+        self.tmux_detach_requested = true;
+        self.queueIo(.{ .write_stable = "\n" }, .unlocked);
+    }
+    return true;
 }
 
 /// Returns a mailbox that can be used to send messages to this surface.
@@ -946,6 +1120,9 @@ pub fn deactivateInspector(self: *Surface) void {
 pub fn needsConfirmQuit(self: *Surface) bool {
     // If the surface is in read-only mode, always require confirmation
     if (self.readonly) return true;
+
+    // Tmux pane surfaces have no child process to kill
+    if (self.io.backend == .tmux) return false;
 
     // If the child has exited, then our process is certainly not alive.
     // We check this first to avoid the locking overhead below.
@@ -1172,6 +1349,70 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .selected = v },
             );
         },
+
+        .tmux_windows_changed => self.handleTmuxWindowsChanged(),
+
+        .tmux_title_changed => |info| {
+            if (comptime termio.StreamHandler.tmux_enabled) {
+                if (self.tmux_pane_surfaces.get(info.pane_id)) |pane_surface| {
+                    const title: [:0]const u8 = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&info.title)), 0);
+                    _ = pane_surface.rt_app.performAction(
+                        .{ .surface = pane_surface },
+                        .set_title,
+                        .{ .title = title },
+                    ) catch |err| {
+                        log.warn("tmux: failed to set pane title err={}", .{err});
+                    };
+                }
+            }
+        },
+
+        .tmux_exited => {
+            if (comptime termio.StreamHandler.tmux_enabled) {
+                const close_after_detach = self.tmux_detach_requested;
+
+                // Collect pane surfaces first — closing them triggers
+                // deinit which modifies tmux_pane_surfaces via swapRemove.
+                var to_close: std.ArrayListUnmanaged(*Surface) = .empty;
+                defer to_close.deinit(self.alloc);
+                var pane_it = self.tmux_pane_surfaces.iterator();
+                while (pane_it.next()) |entry| {
+                    to_close.append(self.alloc, entry.value_ptr.*) catch continue;
+                }
+                // Clear the map BEFORE closing so deinit's swapRemove
+                // doesn't invalidate anything.
+                self.tmux_pane_surfaces.clearRetainingCapacity();
+
+                for (to_close.items) |pane_surface| {
+                    // Null the control surface ref so deinit doesn't
+                    // try to swapRemove from the already-cleared map.
+                    pane_surface.tmux_control_surface = null;
+                    pane_surface.rt_surface.close(false);
+                }
+
+                if (self.tmux_controller) |*c| {
+                    c.deinit();
+                    self.tmux_controller = null;
+                }
+
+                // Print a newline so the shell prompt appears on a fresh line.
+                // Keep this lock scoped so runtime close callbacks can safely
+                // call needsConfirmQuit without recursively locking it.
+                {
+                    self.renderer_state.mutex.lock();
+                    defer self.renderer_state.mutex.unlock();
+                    const t: *terminal.Terminal = &self.io.terminal;
+                    t.carriageReturn();
+                    t.linefeed() catch {};
+                }
+
+                log.info("tmux: control mode ended", .{});
+
+                if (close_after_detach) {
+                    self.rt_surface.close(false);
+                }
+            }
+        },
     }
 }
 
@@ -1314,6 +1555,7 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+        .tmux => &.{"tmux (control mode pane)"},
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
@@ -1379,6 +1621,302 @@ fn childExitedAbnormally(
 
     // Hide the cursor
     t.modes.set(.cursor_visible, false);
+}
+
+/// Handle tmux control mode window/pane state changes. This is called
+/// when the tmux viewer reports that the window/pane layout has changed.
+fn handleTmuxWindowsChanged(self: *Surface) void {
+    if (comptime !termio.StreamHandler.tmux_enabled) return;
+
+    const Layout = terminal.tmux.Layout;
+
+    const WindowPlan = struct {
+        root_pane_id: usize,
+        steps: []const Layout.RestoreStep,
+        name: []const u8,
+    };
+
+    // Arena for snapshot copies of viewer data so we don't access
+    // viewer state after releasing the renderer mutex.
+    var snapshot_arena: std.heap.ArenaAllocator = .init(self.alloc);
+    defer snapshot_arena.deinit();
+    const snap_alloc = snapshot_arena.allocator();
+
+    self.renderer_state.mutex.lock();
+
+    const viewer = self.io.terminal_stream.handler.tmux_viewer orelse {
+        self.renderer_state.mutex.unlock();
+        log.warn("tmux_windows_changed received but no viewer exists", .{});
+        return;
+    };
+
+    const first_time = self.tmux_controller == null;
+
+    // Create the controller on first use
+    if (first_time) {
+        self.tmux_controller = .init(self.alloc, viewer);
+    }
+
+    var controller = &self.tmux_controller.?;
+    _ = controller.syncWindows();
+
+    // Build set of ALL current pane IDs from the viewer
+    var current_panes: std.AutoArrayHashMapUnmanaged(usize, void) = .empty;
+    defer current_panes.deinit(self.alloc);
+    for (viewer.windows.items) |window| {
+        var pane_ids: std.ArrayListUnmanaged(usize) = .empty;
+        defer pane_ids.deinit(self.alloc);
+        window.layout.collectPaneIds(&pane_ids, self.alloc) catch |err| {
+            log.warn("tmux: failed to collect pane IDs err={}", .{err});
+            continue;
+        };
+        for (pane_ids.items) |pane_id| {
+            current_panes.put(self.alloc, pane_id, {}) catch continue;
+        }
+    }
+
+    // Find panes whose tabs/splits should be closed (no longer in viewer)
+    var removed_panes: std.ArrayListUnmanaged(usize) = .empty;
+    defer removed_panes.deinit(self.alloc);
+    for (self.tmux_pane_surfaces.keys()) |pane_id| {
+        if (!current_panes.contains(pane_id)) {
+            removed_panes.append(self.alloc, pane_id) catch continue;
+        }
+    }
+
+    // Snapshot the layout data we need for surface creation. After releasing
+    // the mutex the IO thread may mutate viewer.windows/panes at any time,
+    // so we must not read from the viewer after this point.
+    var window_plans: std.ArrayListUnmanaged(WindowPlan) = .empty;
+    for (viewer.windows.items) |window| {
+        var restore_steps: std.ArrayListUnmanaged(Layout.RestoreStep) = .empty;
+        defer restore_steps.deinit(self.alloc);
+
+        const root_pane_id = (window.layout.buildRestorePlan(&restore_steps, self.alloc) catch |err| {
+            log.warn("tmux: failed to build restore plan err={}", .{err});
+            continue;
+        }) orelse continue;
+
+        const steps_copy = snap_alloc.dupe(Layout.RestoreStep, restore_steps.items) catch continue;
+        const name_copy = snap_alloc.dupe(u8, window.name) catch continue;
+
+        window_plans.append(snap_alloc, .{
+            .root_pane_id = root_pane_id,
+            .steps = steps_copy,
+            .name = name_copy,
+        }) catch continue;
+    }
+
+    // Pre-resolve pane titles while we still hold the mutex. For each pane
+    // we're about to create, look up its current command from viewer.panes.
+    var pane_titles: std.AutoArrayHashMapUnmanaged(usize, []const u8) = .empty;
+    for (window_plans.items) |plan| {
+        resolvePaneTitle(&pane_titles, snap_alloc, viewer, plan.root_pane_id, plan.name);
+        for (plan.steps) |step| {
+            resolvePaneTitle(&pane_titles, snap_alloc, viewer, step.new_pane_id, plan.name);
+        }
+    }
+
+    // Release the mutex before performAction (which creates surfaces synchronously)
+    self.renderer_state.mutex.unlock();
+
+    // Close tabs/splits for removed panes
+    for (removed_panes.items) |pane_id| {
+        if (self.tmux_pane_surfaces.fetchSwapRemove(pane_id)) |entry| {
+            entry.value.rt_surface.close(false);
+        }
+    }
+
+    // Create tabs and splits from the snapshot — no viewer access needed.
+    //
+    // New tabs are inserted relative to the target surface by the app
+    // runtime. If every tmux root pane targets the same surface, runtimes
+    // that insert next to the target can reverse the visible tab order.
+    // Carry the previous root pane forward so the tmux window order is
+    // preserved when recreating tabs after attach.
+    var tab_target: *Surface = if (self.app.focused_surface) |fs|
+        if (fs.io.backend == .tmux) fs else self
+    else
+        self;
+
+    for (window_plans.items) |plan| {
+        const root_surface = self.ensureTmuxPaneSurface(
+            viewer,
+            plan.root_pane_id,
+            pane_titles.get(plan.root_pane_id) orelse plan.name,
+            tab_target,
+            null,
+        ) orelse continue;
+        tab_target = root_surface;
+
+        for (plan.steps) |step| {
+            if (self.tmux_pane_surfaces.contains(step.new_pane_id)) continue;
+
+            const split_target = self.tmux_pane_surfaces.get(step.split_pane_id) orelse {
+                log.warn(
+                    "tmux: missing split target pane %{d} while restoring pane %{d}",
+                    .{ step.split_pane_id, step.new_pane_id },
+                );
+                continue;
+            };
+
+            _ = self.ensureTmuxPaneSurface(
+                viewer,
+                step.new_pane_id,
+                pane_titles.get(step.new_pane_id) orelse plan.name,
+                tab_target,
+                .{
+                    .target = split_target,
+                    .direction = step.direction,
+                    .ratio = step.ratio,
+                },
+            );
+        }
+    }
+
+    if (first_time) {
+        self.writeTmuxHelp();
+    }
+}
+
+fn resolvePaneTitle(
+    titles: *std.AutoArrayHashMapUnmanaged(usize, []const u8),
+    alloc: Allocator,
+    viewer: *terminal.tmux.Viewer,
+    pane_id: usize,
+    window_name: []const u8,
+) void {
+    if (titles.contains(pane_id)) return;
+    const name = if (viewer.panes.getPtr(pane_id)) |pane|
+        if (pane.current_command.len > 0) pane.current_command else window_name
+    else
+        window_name;
+    const effective = if (name.len > 0) name else "tmux";
+    const duped = alloc.dupe(u8, effective) catch return;
+    titles.put(alloc, pane_id, duped) catch return;
+}
+
+fn ensureTmuxPaneSurface(
+    self: *Surface,
+    viewer: *terminal.tmux.Viewer,
+    pane_id: usize,
+    title: []const u8,
+    tab_target: *Surface,
+    split: ?struct {
+        target: *Surface,
+        direction: terminal.tmux.Layout.SplitDirection,
+        ratio: f64,
+    },
+) ?*Surface {
+    if (self.tmux_pane_surfaces.get(pane_id)) |existing| return existing;
+
+    self.app.pending_tmux_surface = .{
+        .pane_id = pane_id,
+        .control_mailbox = &self.io.mailbox,
+        .viewer = viewer,
+        .control_surface = self,
+    };
+
+    if (split) |info| {
+        self.app.pending_split_ratio = info.ratio;
+        _ = self.rt_app.performAction(
+            .{ .surface = info.target },
+            .new_split,
+            switch (info.direction) {
+                .right => .right,
+                .down => .down,
+            },
+        ) catch |err| {
+            log.warn("tmux: failed to create split for pane %{d}: {}", .{ pane_id, err });
+            self.app.pending_tmux_surface = null;
+            self.app.pending_split_ratio = 0.5;
+            return null;
+        };
+        self.app.pending_split_ratio = 0.5;
+    } else {
+        _ = self.rt_app.performAction(
+            .{ .surface = tab_target },
+            .new_tab,
+            {},
+        ) catch |err| {
+            log.warn("tmux: failed to create tab for pane %{d}: {}", .{ pane_id, err });
+            self.app.pending_tmux_surface = null;
+            return null;
+        };
+    }
+
+    const pane_surface = self.tmux_pane_surfaces.get(pane_id) orelse return null;
+    setTmuxPaneSurfaceTitle(pane_surface, title);
+    return pane_surface;
+}
+
+fn setTmuxPaneSurfaceTitle(
+    pane_surface: *Surface,
+    effective_name: []const u8,
+) void {
+    var title_buf: [256]u8 = .{0} ** 256;
+    const len = @min(effective_name.len, title_buf.len - 1);
+    @memcpy(title_buf[0..len], effective_name[0..len]);
+    const title: [:0]const u8 = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&title_buf)), 0);
+    _ = pane_surface.rt_app.performAction(
+        .{ .surface = pane_surface },
+        .set_title,
+        .{ .title = title },
+    ) catch |err| {
+        log.warn("tmux: failed to set pane title err={}", .{err});
+    };
+}
+
+fn writeTmuxHelp(self: *Surface) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = &self.io.terminal;
+
+    const lines = [_][]const u8{
+        "",
+        "  Ghostty tmux control mode active",
+        "",
+        "  Keybindings:",
+        "    Esc  Detach from session",
+        "    x    Force-quit tmux mode",
+        "",
+        "  Tmux panes are displayed in separate tabs.",
+        "  Use Cmd+T in a tmux tab to create a new window.",
+        "",
+    };
+
+    for (lines) |line| {
+        t.carriageReturn();
+        t.linefeed() catch return;
+        t.printString(line) catch return;
+    }
+}
+
+/// Format key bytes as a tmux send-keys command and write to the pty.
+fn sendTmuxKeys(self: *Surface, pane_id: usize, data: []const u8) void {
+    // Build the command on the stack — zero heap allocations.
+    // Worst case: "send-keys -t %<20 digits> -H" + " XX" * 38 + "\n" < 256
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+
+    const prefix = std.fmt.bufPrint(buf[pos..], "send-keys -t %{d} -H", .{pane_id}) catch return;
+    pos += prefix.len;
+
+    for (data) |byte| {
+        const hex = std.fmt.bufPrint(buf[pos..], " {x:0>2}", .{byte}) catch return;
+        pos += hex.len;
+    }
+
+    if (pos >= buf.len) return;
+    buf[pos] = '\n';
+    pos += 1;
+
+    const msg = termio.Message.writeReq(self.alloc, buf[0..pos]) catch return;
+    self.queueIo(switch (msg) {
+        .write_small => |v| .{ .write_small = v },
+        .write_alloc => |v| .{ .write_alloc = v },
+        else => return,
+    }, .unlocked);
 }
 
 /// Called when the terminal detects there is a password input prompt.
@@ -1593,7 +2131,7 @@ fn mouseRefreshLinks(
         const left_idx = @intFromEnum(input.MouseButton.left);
         if (self.mouse.click_state[left_idx] == .press) click: {
             const pin = self.mouse.left_click_pin orelse break :click;
-            const click_pt = self.io.terminal.screens.active.pages.pointFromPin(
+            const click_pt = self.renderer_state.terminal.screens.active.pages.pointFromPin(
                 .viewport,
                 pin.*,
             ) orelse break :click;
@@ -1607,7 +2145,7 @@ fn mouseRefreshLinks(
         const link = (try self.linkAtPos(pos)) orelse break :link .{ null, false };
         switch (link.action) {
             .open => {
-                const str = try self.io.terminal.screens.active.selectionString(alloc, .{
+                const str = try self.renderer_state.terminal.screens.active.selectionString(alloc, .{
                     .sel = link.selection,
                     .trim = false,
                 });
@@ -1662,7 +2200,7 @@ fn mouseRefreshLinks(
         _ = try self.rt_app.performAction(
             .{ .surface = self },
             .mouse_shape,
-            self.io.terminal.mouse_shape,
+            self.renderer_state.terminal.mouse_shape,
         );
         _ = try self.rt_app.performAction(
             .{ .surface = self },
@@ -1921,7 +2459,7 @@ pub fn dumpTextLocked(
     sel: terminal.Selection,
 ) !Text {
     // Read out the text
-    const text = try self.io.terminal.screens.active.selectionString(alloc, .{
+    const text = try self.renderer_state.terminal.screens.active.selectionString(alloc, .{
         .sel = sel,
         .trim = false,
     });
@@ -1931,19 +2469,19 @@ pub fn dumpTextLocked(
     const vp: ?Text.Viewport = viewport: {
         // If our bottom right pin is before the viewport, then we can't
         // possibly have this text be within the viewport.
-        const vp_tl_pin = self.io.terminal.screens.active.pages.getTopLeft(.viewport);
-        const br_pin = sel.bottomRight(self.io.terminal.screens.active);
+        const vp_tl_pin = self.renderer_state.terminal.screens.active.pages.getTopLeft(.viewport);
+        const br_pin = sel.bottomRight(self.renderer_state.terminal.screens.active);
         if (br_pin.before(vp_tl_pin)) break :viewport null;
 
         // If our top-left pin is after the viewport, then we can't possibly
         // have this text be within the viewport.
-        const vp_br_pin = self.io.terminal.screens.active.pages.getBottomRight(.viewport) orelse {
+        const vp_br_pin = self.renderer_state.terminal.screens.active.pages.getBottomRight(.viewport) orelse {
             // I don't think this is possible but I don't want to crash on
             // that assertion so let's just break out...
             log.warn("viewport bottom-right pin not found, bug?", .{});
             break :viewport null;
         };
-        const tl_pin = sel.topLeft(self.io.terminal.screens.active);
+        const tl_pin = sel.topLeft(self.renderer_state.terminal.screens.active);
         if (vp_br_pin.before(tl_pin)) break :viewport null;
 
         // We established that our top-left somewhere before the viewport
@@ -1953,7 +2491,7 @@ pub fn dumpTextLocked(
 
         // Our top-left point. If it doesn't exist in the viewport it must
         // be before and we can return (0,0).
-        const tl_pt: terminal.Point = self.io.terminal.screens.active.pages.pointFromPin(
+        const tl_pt: terminal.Point = self.renderer_state.terminal.screens.active.pages.pointFromPin(
             .viewport,
             tl_pin,
         ) orelse tl: {
@@ -1966,7 +2504,7 @@ pub fn dumpTextLocked(
 
         // Our bottom-right point. If it doesn't exist in the viewport
         // it must be the bottom-right of the viewport.
-        const br_pt = self.io.terminal.screens.active.pages.pointFromPin(
+        const br_pt = self.renderer_state.terminal.screens.active.pages.pointFromPin(
             .viewport,
             br_pin,
         ) orelse br: {
@@ -1974,7 +2512,7 @@ pub fn dumpTextLocked(
                 assert(vp_br_pin.before(br_pin));
             }
 
-            break :br self.io.terminal.screens.active.pages.pointFromPin(
+            break :br self.renderer_state.terminal.screens.active.pages.pointFromPin(
                 .viewport,
                 vp_br_pin,
             ).?;
@@ -2015,8 +2553,8 @@ pub fn dumpTextLocked(
         };
 
         // Utilize viewport sizing to convert to offsets
-        const start = tl_coord.y * self.io.terminal.screens.active.pages.cols + tl_coord.x;
-        const end = br_coord.y * self.io.terminal.screens.active.pages.cols + br_coord.x;
+        const start = tl_coord.y * self.renderer_state.terminal.screens.active.pages.cols + tl_coord.x;
+        const end = br_coord.y * self.renderer_state.terminal.screens.active.pages.cols + br_coord.x;
 
         break :viewport .{
             .tl_px_x = x,
@@ -2036,15 +2574,15 @@ pub fn dumpTextLocked(
 pub fn hasSelection(self: *const Surface) bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    return self.io.terminal.screens.active.selection != null;
+    return self.renderer_state.terminal.screens.active.selection != null;
 }
 
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    const sel = self.io.terminal.screens.active.selection orelse return null;
-    return try self.io.terminal.screens.active.selectionString(alloc, .{
+    const sel = self.renderer_state.terminal.screens.active.selection orelse return null;
+    return try self.renderer_state.terminal.screens.active.selectionString(alloc, .{
         .sel = sel,
         .trim = false,
     });
@@ -2090,9 +2628,9 @@ fn resolvePathForOpening(
 /// keyboard should be rendered.
 pub fn imePoint(self: *const Surface) apprt.IMEPos {
     self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
     const cursor = self.renderer_state.terminal.screens.active.cursor;
     const preedit_width: usize = if (self.renderer_state.preedit) |preedit| preedit.width() else 0;
-    self.renderer_state.mutex.unlock();
 
     // TODO: need to handle when scrolling and the cursor is not
     // in the visible portion of the screen.
@@ -2236,7 +2774,7 @@ fn copySelectionToClipboards(
     var contents: std.ArrayList(apprt.ClipboardContent) = .empty;
     switch (format) {
         .plain => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
+            var formatter: ScreenFormatter = .init(self.renderer_state.terminal.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
             try contents.append(alloc, .{
@@ -2246,7 +2784,7 @@ fn copySelectionToClipboards(
         },
 
         .vt => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts: {
+            var formatter: ScreenFormatter = .init(self.renderer_state.terminal.screens.active, opts: {
                 var copy = opts;
                 copy.emit = .vt;
                 break :opts copy;
@@ -2263,7 +2801,7 @@ fn copySelectionToClipboards(
         },
 
         .html => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts: {
+            var formatter: ScreenFormatter = .init(self.renderer_state.terminal.screens.active, opts: {
                 var copy = opts;
                 copy.emit = .html;
                 break :opts copy;
@@ -2281,7 +2819,7 @@ fn copySelectionToClipboards(
 
         .mixed => {
             // First, generate plain text with codepoint mappings applied
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
+            var formatter: ScreenFormatter = .init(self.renderer_state.terminal.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
             try contents.append(alloc, .{
@@ -2291,7 +2829,7 @@ fn copySelectionToClipboards(
 
             assert(aw.written().len == 0);
             // Second, generate HTML without codepoint mappings
-            formatter = .init(self.io.terminal.screens.active, opts: {
+            formatter = .init(self.renderer_state.terminal.screens.active, opts: {
                 var copy = opts;
                 copy.emit = .html;
 
@@ -2331,8 +2869,8 @@ fn copySelectionToClipboards(
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
-    const prev_ = self.io.terminal.screens.active.selection;
-    try self.io.terminal.screens.active.select(sel_);
+    const prev_ = self.renderer_state.terminal.screens.active.selection;
+    try self.renderer_state.terminal.screens.active.select(sel_);
 
     // If copy on select is false then exit early.
     if (self.config.copy_on_select == .false) return;
@@ -2458,6 +2996,103 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     if (self.size.screen.equals(new_screen_size)) return;
 
     try self.resize(new_screen_size);
+
+    // For tmux pane surfaces, tell tmux about the new size.
+    // Two-command strategy:
+    //   1. resize-window sets the overall tmux window dimensions.
+    //      This operates on the layout area (excluding status bar),
+    //      so tmux handles its own status bar internally.
+    //   2. resize-pane sets this pane's exact grid, overriding
+    //      tmux's default row distribution.
+    // The total comes from computeTotalSize which walks the layout
+    // tree, summing each pane surface's actual grid + border cells.
+    if (comptime termio.StreamHandler.tmux_enabled) {
+        if (self.io.backend == .tmux) {
+            if (self.tmux_control_surface) |ctrl| {
+                const tmux = &self.io.backend.tmux;
+
+                // Don't send if any pane surface hasn't been laid
+                // out by the apprt yet (still at initialization default).
+                var all_settled = true;
+                var pane_it = ctrl.tmux_pane_surfaces.iterator();
+                while (pane_it.next()) |entry| {
+                    const ps = entry.value_ptr.*;
+                    if (ps != self and !ps.rt_surface.size_settled) {
+                        all_settled = false;
+                        break;
+                    }
+                }
+
+                if (all_settled) {
+                    for (tmux.viewer.windows.items) |window| {
+                        // Find the window containing this pane
+                        if (window.layout.findPane(tmux.pane_id) == null) continue;
+
+                        const total = window.layout.computeTotalSize(Surface, &ctrl.tmux_pane_surfaces);
+                        if (total.width == 0 or total.height == 0) break;
+                        var pane_ids: std.ArrayListUnmanaged(usize) = .empty;
+                        defer pane_ids.deinit(self.alloc);
+                        window.layout.collectPaneIds(&pane_ids, self.alloc) catch |err| {
+                            log.warn("tmux: failed to collect pane IDs err={}", .{err});
+                            break;
+                        };
+
+                        var cmd_builder: std.Io.Writer.Allocating = .init(self.alloc);
+                        defer cmd_builder.deinit();
+
+                        cmd_builder.writer.print(
+                            "resize-window -t @{d} -x {d} -y {d}\n",
+                            .{ window.id, total.width, total.height },
+                        ) catch break;
+
+                        for (pane_ids.items) |pane_id| {
+                            const pane_surface = ctrl.tmux_pane_surfaces.get(pane_id) orelse continue;
+                            const grid = pane_surface.size.grid();
+                            cmd_builder.writer.print(
+                                "resize-pane -t %{d} -x {d} -y {d}\n",
+                                .{ pane_id, grid.columns, grid.rows },
+                            ) catch break;
+                        }
+
+                        tmux.queueTmuxCommand(cmd_builder.writer.buffered());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Like sizeCallback but for split border drags. Sends resize-pane
+/// to tmux instead of refresh-client -C, since the total window
+/// size hasn't changed — only the split ratio has.
+pub fn sizeCallbackSplitDrag(self: *Surface, size: apprt.SurfaceSize) !void {
+    crash.sentry.thread_state = self.crashThreadState();
+    defer crash.sentry.thread_state = null;
+
+    const new_screen_size: rendererpkg.ScreenSize = .{
+        .width = size.width,
+        .height = size.height,
+    };
+
+    if (self.size.screen.equals(new_screen_size)) return;
+
+    try self.resize(new_screen_size);
+
+    if (comptime termio.StreamHandler.tmux_enabled) {
+        if (self.io.backend == .tmux) {
+            if (self.tmux_control_surface != null) {
+                const tmux = &self.io.backend.tmux;
+                const grid = self.size.grid();
+
+                var cmd_buf: [128]u8 = undefined;
+                const cmd = std.fmt.bufPrint(&cmd_buf, "resize-pane -t %{d} -x {d} -y {d}\n", .{
+                    tmux.pane_id, grid.columns, grid.rows,
+                }) catch return;
+                tmux.queueTmuxCommand(cmd);
+            }
+        }
+    }
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
@@ -2481,12 +3116,33 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 
     // Mail the IO thread
     self.queueIo(.{ .resize = self.size }, .unlocked);
+
+    // If this is the tmux control surface (exec backend with a controller),
+    // tell tmux the new client size. Pane surfaces (tmux backend) must NOT
+    // send this — it would be routed through send-keys to the shell.
+    if (comptime termio.StreamHandler.tmux_enabled) {
+        if (self.tmux_controller != null and
+            self.io.backend == .exec and
+            self.tmux_pane_surfaces.count() > 0)
+        {
+            var cmd_buf: [64]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&cmd_buf, "refresh-client -C {d},{d}\n", .{
+                grid_size.columns, grid_size.rows,
+            }) catch return;
+            const msg = termio.Message.writeReq(self.alloc, cmd) catch return;
+            self.queueIo(switch (msg) {
+                .write_small => |v| .{ .write_small = v },
+                .write_alloc => |v| .{ .write_alloc = v },
+                else => return,
+            }, .unlocked);
+        }
+    }
 }
 
 /// Recalculate the balanced padding if needed.
 fn balancePaddingIfNeeded(self: *Surface) void {
     if (self.config.window_padding_balance == .false) return;
-    const content_scale = try self.rt_surface.getContentScale();
+    const content_scale = self.rt_surface.getContentScale() catch return;
     const x_dpi = content_scale.x * font.face.default_dpi;
     const y_dpi = content_scale.y * font.face.default_dpi;
     self.size.balancePadding(self.config.scaledPadding(x_dpi, y_dpi), self.config.window_padding_balance);
@@ -2677,7 +3333,7 @@ pub fn keyCallback(
     if (self.config.vt_kam_allowed) {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-        if (self.io.terminal.modes.get(.disable_keyboard)) return .consumed;
+        if (self.renderer_state.terminal.modes.get(.disable_keyboard)) return .consumed;
     }
 
     // If this input event has text, then we hide the mouse if configured.
@@ -2701,7 +3357,7 @@ pub fn keyCallback(
         // 1. mouse reporting is off
         // OR
         // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
+        if (self.renderer_state.terminal.flags.mouse_event == .none or
             (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
         {
             // Refresh our link state
@@ -2716,12 +3372,12 @@ pub fn keyCallback(
                 log.warn("failed to refresh links err={}", .{err});
                 break :mouse_mods;
             };
-        } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
+        } else if (self.renderer_state.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
             // If we have mouse reports on and we don't have shift pressed, we reset state
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                self.renderer_state.terminal.mouse_shape,
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -2736,8 +3392,8 @@ pub fn keyCallback(
     // needed, depending on the key state.
     if ((SurfaceMouse{
         .physical_key = event.key,
-        .mouse_event = self.io.terminal.flags.mouse_event,
-        .mouse_shape = self.io.terminal.mouse_shape,
+        .mouse_event = self.renderer_state.terminal.flags.mouse_event,
+        .mouse_shape = self.renderer_state.terminal.mouse_shape,
         .mods = self.mouse.mods,
         .over_link = self.mouse.over_link,
         .hidden = self.mouse.hidden,
@@ -2770,6 +3426,31 @@ pub fn keyCallback(
         break :event copy;
     };
 
+    // If this is the tmux control surface, intercept specific keys
+    // to control the tmux session instead of passing them to the pty.
+    if (comptime termio.StreamHandler.tmux_enabled) {
+        if (self.tmux_controller != null and self.io.backend == .exec) {
+            if (event.action == .press or event.action == .repeat) {
+                if (event.key == .escape and event.mods.empty()) {
+                    // Esc = detach cleanly (empty line detaches in control mode)
+                    self.queueIo(.{
+                        .write_stable = "\n",
+                    }, .unlocked);
+                    return .consumed;
+                }
+                if (event.key == .key_x and event.mods.empty()) {
+                    // X = force quit tmux mode (send empty line to detach)
+                    self.queueIo(.{
+                        .write_stable = "\n",
+                    }, .unlocked);
+                    return .consumed;
+                }
+            }
+            // All other keys are consumed but ignored in the control tab
+            return .consumed;
+        }
+    }
+
     // Encode and send our key. If we didn't encode anything, then we
     // return the effect as ignored.
     if (try self.encodeKey(
@@ -2785,6 +3466,24 @@ pub fn keyCallback(
         }
 
         errdefer write_req.deinit();
+
+        // If this surface uses the tmux backend, route input through
+        // send-keys instead of writing directly to the pty.
+        if (comptime termio.StreamHandler.tmux_enabled) {
+            if (self.io.backend == .tmux) {
+                if (self.tmux_controller) |controller| {
+                    if (controller.activePaneId()) |pane_id| {
+                        const data = write_req.slice();
+                        if (data.len > 0) {
+                            self.sendTmuxKeys(pane_id, data);
+                            write_req.deinit();
+                            return .consumed;
+                        }
+                    }
+                }
+            }
+        }
+
         self.queueIo(switch (write_req) {
             .small => |v| .{ .write_small = v },
             .stable => |v| .{ .write_stable = v },
@@ -2808,7 +3507,7 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) self.renderer_state.terminal.scrollViewport(.bottom);
 
         try self.queueRender();
     }
@@ -3508,16 +4207,18 @@ pub fn scrollCallback(
         // we convert to cursor keys. This only happens if we're:
         // (1) alt screen (2) no explicit mouse reporting and (3) alt
         // scroll mode enabled.
-        if (self.io.terminal.screens.active_key == .alternate and
-            self.io.terminal.flags.mouse_event == .none and
-            self.io.terminal.modes.get(.mouse_alternate_scroll))
+        // For tmux pane surfaces, always scroll the viewport directly.
+        if (self.io.backend != .tmux and
+            self.renderer_state.terminal.screens.active_key == .alternate and
+            self.renderer_state.terminal.flags.mouse_event == .none and
+            self.renderer_state.terminal.modes.get(.mouse_alternate_scroll))
         {
             if (y.delta != 0) {
                 // When we send mouse events as cursor keys we always
                 // clear the selection.
                 try self.setSelection(null);
 
-                const seq = if (self.io.terminal.modes.get(.cursor_keys)) seq: {
+                const seq = if (self.renderer_state.terminal.modes.get(.cursor_keys)) seq: {
                     // cursor key: application mode
                     break :seq switch (y.direction()) {
                         .up_right => "\x1bOA",
@@ -3543,7 +4244,8 @@ pub fn scrollCallback(
         // the normal logic.
 
         // If we're scrolling up or down, then send a mouse event.
-        if (self.isMouseReporting()) {
+        // For tmux pane surfaces, always scroll the viewport directly.
+        if (self.io.backend != .tmux and self.isMouseReporting()) {
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 self.mouseReport(switch (y.direction()) {
@@ -3569,7 +4271,7 @@ pub fn scrollCallback(
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
-            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            self.renderer_state.terminal.scrollViewport(.{ .delta = y.delta * -1 });
         }
     }
 
@@ -3617,7 +4319,7 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 /// the terminal state.
 fn isMouseReporting(self: *const Surface) bool {
     return self.config.mouse_reporting and
-        self.io.terminal.flags.mouse_event != .none;
+        self.renderer_state.terminal.flags.mouse_event != .none;
 }
 
 fn mouseReport(
@@ -3629,7 +4331,7 @@ fn mouseReport(
 ) void {
     // Mouse reporting must be enabled by both config and terminal state
     assert(self.config.mouse_reporting);
-    assert(self.io.terminal.flags.mouse_event != .none);
+    assert(self.renderer_state.terminal.flags.mouse_event != .none);
 
     // Build our encoding options.
     const encoding_opts: input.mouse_encode.Options = opts: {
@@ -3719,7 +4421,7 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
 pub fn mouseCaptured(self: *Surface) bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    return self.io.terminal.flags.mouse_event != .none;
+    return self.renderer_state.terminal.flags.mouse_event != .none;
 }
 
 /// Called for mouse button press/release events. This will return true
@@ -3812,7 +4514,7 @@ pub fn mouseButtonCallback(
         if (self.config.copy_on_select != .false) {
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
-            const prev_ = self.io.terminal.screens.active.selection;
+            const prev_ = self.renderer_state.terminal.screens.active.selection;
             if (prev_) |prev| {
                 try self.setSelection(terminal.Selection.init(
                     prev.start(),
@@ -3968,8 +4670,8 @@ pub fn mouseButtonCallback(
             // Single click
             1 => {
                 // If we have a selection, clear it. This always happens.
-                if (self.io.terminal.screens.active.selection != null) {
-                    try self.io.terminal.screens.active.select(null);
+                if (self.renderer_state.terminal.screens.active.selection != null) {
+                    try self.renderer_state.terminal.screens.active.select(null);
                     try self.queueRender();
                 }
             },
@@ -3990,10 +4692,10 @@ pub fn mouseButtonCallback(
                         // Ignore any errors, likely regex errors.
                     }
 
-                    break :sel self.io.terminal.screens.active.selectWord(pin.*, self.config.selection_word_chars);
+                    break :sel self.renderer_state.terminal.screens.active.selectWord(pin.*, self.config.selection_word_chars);
                 };
                 if (sel_) |sel| {
-                    try self.io.terminal.screens.active.select(sel);
+                    try self.renderer_state.terminal.screens.active.select(sel);
                     try self.queueRender();
                 }
             },
@@ -4001,11 +4703,11 @@ pub fn mouseButtonCallback(
             // Triple click, select the line under our mouse
             3 => {
                 const sel_ = if (mods.ctrlOrSuper())
-                    self.io.terminal.screens.active.selectOutput(pin.*)
+                    self.renderer_state.terminal.screens.active.selectOutput(pin.*)
                 else
-                    self.io.terminal.screens.active.selectLine(.{ .pin = pin.* });
+                    self.renderer_state.terminal.screens.active.selectLine(.{ .pin = pin.* });
                 if (sel_) |sel| {
-                    try self.io.terminal.screens.active.select(sel);
+                    try self.renderer_state.terminal.screens.active.select(sel);
                     try self.queueRender();
                 }
             },
@@ -4066,7 +4768,7 @@ pub fn mouseButtonCallback(
             .@"context-menu" => {
                 // If we already have a selection and the selection contains
                 // where we clicked then we don't want to modify the selection.
-                if (self.io.terminal.screens.active.selection) |prev_sel| {
+                if (self.renderer_state.terminal.screens.active.selection) |prev_sel| {
                     if (prev_sel.contains(screen, pin)) break :sel;
 
                     // The selection doesn't contain our pin, so we create a new
@@ -4090,7 +4792,7 @@ pub fn mouseButtonCallback(
                 return false;
             },
             .copy => {
-                if (self.io.terminal.screens.active.selection) |sel| {
+                if (self.renderer_state.terminal.screens.active.selection) |sel| {
                     try self.copySelectionToClipboards(
                         sel,
                         &.{.standard},
@@ -4101,7 +4803,7 @@ pub fn mouseButtonCallback(
                 try self.setSelection(null);
                 try self.queueRender();
             },
-            .@"copy-or-paste" => if (self.io.terminal.screens.active.selection) |sel| {
+            .@"copy-or-paste" => if (self.renderer_state.terminal.screens.active.selection) |sel| {
                 try self.copySelectionToClipboards(
                     sel,
                     &.{.standard},
@@ -4357,7 +5059,7 @@ fn linkAtPin(
 fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
     // In any of these scenarios, whatever mods are set (even shift)
     // are preserved.
-    if (self.io.terminal.flags.mouse_event == .none) return mods;
+    if (self.renderer_state.terminal.flags.mouse_event == .none) return mods;
     if (!mods.shift) return mods;
     if (self.mouseShiftCapture(false)) return mods;
 
@@ -4376,7 +5078,7 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
     const link = try self.linkAtPos(pos) orelse return false;
     switch (link.action) {
         .open => {
-            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
+            const str = try self.renderer_state.terminal.screens.active.selectionString(self.alloc, .{
                 .sel = link.selection,
                 .trim = false,
             });
@@ -4467,11 +5169,11 @@ pub fn mousePressureCallback(
         // This should always be set in this state but we don't want
         // to handle state inconsistency here.
         const pin = self.mouse.left_click_pin orelse break :select;
-        const sel = self.io.terminal.screens.active.selectWord(
+        const sel = self.renderer_state.terminal.screens.active.selectWord(
             pin.*,
             self.config.selection_word_chars,
         ) orelse break :select;
-        try self.io.terminal.screens.active.select(sel);
+        try self.renderer_state.terminal.screens.active.select(sel);
         try self.queueRender();
     }
 }
@@ -4510,7 +5212,7 @@ pub fn cursorPosCallback(
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                self.renderer_state.terminal.mouse_shape,
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -4590,7 +5292,7 @@ pub fn cursorPosCallback(
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
+        (self.renderer_state.terminal.flags.mouse_event == .none or
             (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
     {
         // If we were previously over a link, we always update. We do this so that if the text
@@ -4689,7 +5391,7 @@ fn dragLeftClickDouble(
     self: *Surface,
     drag_pin: terminal.Pin,
 ) !void {
-    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
     const click_pin = self.mouse.left_click_pin.?.*;
 
     // Get the word closest to our starting click.
@@ -4715,13 +5417,13 @@ fn dragLeftClickDouble(
     // If our current mouse position is before the starting position,
     // then the selection start is the word nearest our current position.
     if (drag_pin.before(click_pin)) {
-        try self.io.terminal.screens.active.select(.init(
+        try self.renderer_state.terminal.screens.active.select(.init(
             word_current.start(),
             word_start.end(),
             false,
         ));
     } else {
-        try self.io.terminal.screens.active.select(.init(
+        try self.renderer_state.terminal.screens.active.select(.init(
             word_start.start(),
             word_current.end(),
             false,
@@ -4734,7 +5436,7 @@ fn dragLeftClickTriple(
     self: *Surface,
     drag_pin: terminal.Pin,
 ) !void {
-    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
     const click_pin = self.mouse.left_click_pin.?.*;
 
     // Get the line selection under our current drag point. If there isn't a
@@ -4753,7 +5455,7 @@ fn dragLeftClickTriple(
     } else {
         sel.endPtr().* = line.end();
     }
-    try self.io.terminal.screens.active.select(sel);
+    try self.renderer_state.terminal.screens.active.select(sel);
 }
 
 fn dragLeftClickSingle(
@@ -4762,7 +5464,7 @@ fn dragLeftClickSingle(
     drag_x: f64,
 ) !void {
     // This logic is in a separate function so that it can be unit tested.
-    try self.io.terminal.screens.active.select(mouseSelection(
+    try self.renderer_state.terminal.screens.active.select(mouseSelection(
         self.mouse.left_click_pin.?.*,
         drag_pin,
         @intFromFloat(@max(0.0, self.mouse.left_click_xpos)),
@@ -4951,7 +5653,7 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
-    self.io.terminal.scrollViewport(.{ .bottom = {} });
+    self.renderer_state.terminal.scrollViewport(.{ .bottom = {} });
     try self.queueRender();
 }
 
@@ -5090,7 +5792,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     log.warn("error scrolling to bottom err={}", .{err});
                 };
 
-                break :normal !self.io.terminal.modes.get(.cursor_keys);
+                break :normal !self.renderer_state.terminal.modes.get(.cursor_keys);
             };
 
             if (normal) {
@@ -5210,7 +5912,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            if (self.io.terminal.screens.active.selection) |sel| {
+            if (self.renderer_state.terminal.screens.active.selection) |sel| {
                 try self.copySelectionToClipboards(
                     sel,
                     &.{.standard},
@@ -5245,7 +5947,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 const url_text = switch (link_info.action) {
                     .open => url_text: {
                         // For regex links, get the text from selection
-                        break :url_text (self.io.terminal.screens.active.selectionString(self.alloc, .{
+                        break :url_text (self.renderer_state.terminal.screens.active.selectionString(self.alloc, .{
                             .sel = link_info.selection,
                             .trim = self.config.clipboard_trim_trailing_spaces,
                         })) catch |err| {
@@ -5387,7 +6089,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
-                if (self.io.terminal.screens.active_key == .alternate) return false;
+                if (self.renderer_state.terminal.screens.active_key == .alternate) return false;
             }
 
             self.queueIo(.{
@@ -5422,9 +6124,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
-                const sel = self.io.terminal.screens.active.selection orelse return false;
-                const tl = sel.topLeft(self.io.terminal.screens.active);
-                self.io.terminal.screens.active.scroll(.{ .pin = tl });
+                const sel = self.renderer_state.terminal.screens.active.selection orelse return false;
+                const tl = sel.topLeft(self.renderer_state.terminal.screens.active);
+                self.renderer_state.terminal.screens.active.scroll(.{ .pin = tl });
             }
 
             try self.queueRender();
@@ -5479,11 +6181,24 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
-        .new_tab => return try self.rt_app.performAction(
-            .{ .surface = self },
-            .new_tab,
-            {},
-        ),
+        .new_tab => {
+            // If a tmux pane surface is focused, create a tmux window
+            // instead of a normal tab.
+            if (comptime termio.StreamHandler.tmux_enabled) {
+                if (self.io.backend == .tmux) {
+                    const tmux = &self.io.backend.tmux;
+                    if (tmux.active) {
+                        tmux.queueTmuxCommand("new-window\n");
+                        return true;
+                    }
+                }
+            }
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_tab,
+                {},
+            );
+        },
 
         .close_tab => |v| return try self.rt_app.performAction(
             .{ .surface = self },
@@ -5517,20 +6232,47 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .{ .amount = position },
         ),
 
-        .new_split => |direction| return try self.rt_app.performAction(
-            .{ .surface = self },
-            .new_split,
-            switch (direction) {
-                .right => .right,
-                .left => .left,
-                .down => .down,
-                .up => .up,
-                .auto => if (self.size.screen.width > self.size.screen.height)
-                    .right
-                else
-                    .down,
-            },
-        ),
+        .new_split => |direction| {
+            // If a tmux pane surface is focused, create a tmux split
+            // instead of a normal split.
+            if (comptime termio.StreamHandler.tmux_enabled) {
+                if (self.io.backend == .tmux) {
+                    const tmux = &self.io.backend.tmux;
+                    if (tmux.active) {
+                        const resolved = switch (direction) {
+                            .right, .left => "-h",
+                            .down, .up => "-v",
+                            .auto => if (self.size.screen.width > self.size.screen.height)
+                                "-h"
+                            else
+                                "-v",
+                        };
+                        var buf: [128]u8 = undefined;
+                        const cmd = std.fmt.bufPrint(
+                            &buf,
+                            "split-window -t %{d} {s}\n",
+                            .{ tmux.pane_id, resolved },
+                        ) catch return true;
+                        tmux.queueTmuxCommand(cmd);
+                        return true;
+                    }
+                }
+            }
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_split,
+                switch (direction) {
+                    .right => .right,
+                    .left => .left,
+                    .down => .down,
+                    .up => .up,
+                    .auto => if (self.size.screen.width > self.size.screen.height)
+                        .right
+                    else
+                        .down,
+                },
+            );
+        },
 
         .goto_split => |direction| return try self.rt_app.performAction(
             .{ .surface = self },
@@ -5662,7 +6404,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            const sel = self.io.terminal.screens.active.selectAll();
+            const sel = self.renderer_state.terminal.screens.active.selectAll();
             if (sel) |s| {
                 try self.setSelection(s);
                 try self.queueRender();
@@ -5795,7 +6537,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            const screen: *terminal.Screen = self.io.terminal.screens.active;
+            const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
             const sel = if (screen.selection) |*sel| sel else {
                 // If we don't have a selection we do not perform this
                 // action, allowing the keybind to fall through to the
@@ -5910,12 +6652,12 @@ fn writeScreenFile(
         // We only dump history if we have history. We still keep
         // the file and write the empty file to the pty so that this
         // command always works on the primary screen.
-        const pages = &self.io.terminal.screens.active.pages;
+        const pages = &self.renderer_state.terminal.screens.active.pages;
         const sel_: ?terminal.Selection = switch (loc) {
             .history => history: {
                 // We do not support this for alternate screens
                 // because they don't have scrollback anyways.
-                if (self.io.terminal.screens.active_key == .alternate) {
+                if (self.renderer_state.terminal.screens.active_key == .alternate) {
                     break :history null;
                 }
 
@@ -5936,7 +6678,7 @@ fn writeScreenFile(
                 );
             },
 
-            .selection => self.io.terminal.screens.active.selection,
+            .selection => self.renderer_state.terminal.screens.active.selection,
         };
 
         const sel = sel_ orelse {
@@ -5946,7 +6688,7 @@ fn writeScreenFile(
         };
 
         const ScreenFormatter = terminal.formatter.ScreenFormatter;
-        var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, .{
+        var formatter: ScreenFormatter = .init(self.renderer_state.terminal.screens.active, .{
             .emit = switch (write_screen.emit) {
                 .plain => .plain,
                 .vt => .vt,
@@ -5959,7 +6701,7 @@ fn writeScreenFile(
             .palette = &self.io.terminal.colors.palette.current,
         });
         formatter.content = .{ .selection = sel.ordered(
-            self.io.terminal.screens.active,
+            self.renderer_state.terminal.screens.active,
             .forward,
         ) };
         try formatter.format(buf_writer);

@@ -198,7 +198,7 @@ pub const Handler = struct {
         };
     }
 
-    fn discard(self: *Handler) void {
+    pub fn discard(self: *Handler) void {
         self.state.deinit();
         self.state = .inactive;
     }

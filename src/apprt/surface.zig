@@ -108,6 +108,23 @@ pub const Message = union(enum) {
     /// Selected search index change
     search_selected: ?usize,
 
+    /// The tmux viewer's window/pane state has changed. The control
+    /// surface should update native tabs/splits to match.
+    tmux_windows_changed: void,
+
+    /// A tmux pane's title changed. The control surface should
+    /// update the corresponding pane tab's title.
+    tmux_title_changed: TmuxTitleChanged,
+
+    /// The tmux control mode session has ended. The control surface
+    /// should clean up all tmux-related state.
+    tmux_exited: void,
+
+    pub const TmuxTitleChanged = struct {
+        pane_id: usize,
+        title: [256]u8,
+    };
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 

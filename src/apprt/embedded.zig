@@ -416,6 +416,11 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
+    /// True once the apprt has called updateSize at least once,
+    /// meaning the surface has its real layout dimensions (not the
+    /// 800x600 initialization default).
+    size_settled: bool = false,
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
@@ -803,10 +808,26 @@ pub const Surface = struct {
             .width = width,
             .height = height,
         };
+        self.size_settled = true;
 
         // Call the primary callback.
         self.core_surface.sizeCallback(self.size) catch |err| {
             log.err("error in size callback err={}", .{err});
+            return;
+        };
+    }
+
+    pub fn updateSizeDrag(self: *Surface, width: u32, height: u32) void {
+        if (self.size.width == width and self.size.height == height) return;
+
+        self.size = .{
+            .width = width,
+            .height = height,
+        };
+        self.size_settled = true;
+
+        self.core_surface.sizeCallbackSplitDrag(self.size) catch |err| {
+            log.err("error in split drag size callback err={}", .{err});
             return;
         };
     }
@@ -1512,6 +1533,10 @@ pub const CAPI = struct {
         return v.core_app.needsConfirmQuit();
     }
 
+    export fn ghostty_app_pending_split_ratio(v: *App) f64 {
+        return v.core_app.pending_split_ratio;
+    }
+
     /// Returns true if the app has global keybinds.
     export fn ghostty_app_has_global_keybinds(v: *App) bool {
         return v.hasGlobalKeybinds();
@@ -1695,6 +1720,12 @@ pub const CAPI = struct {
     /// to the pty and the renderer.
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
         surface.updateSize(w, h);
+    }
+
+    /// Update the size of a surface due to a split border drag.
+    /// This sends resize-pane to tmux instead of refresh-client -C.
+    export fn ghostty_surface_set_size_drag(surface: *Surface, w: u32, h: u32) void {
+        surface.updateSizeDrag(w, h);
     }
 
     /// Return the size information a surface has.
@@ -1921,16 +1952,35 @@ pub const CAPI = struct {
     /// Request that the surface become closed. This will go through the
     /// normal trigger process that a close surface input binding would.
     export fn ghostty_surface_request_close(ptr: *Surface) void {
-        ptr.core_surface.close();
+        _ = ptr.core_surface.requestClose();
+    }
+
+    /// Request that the surface become closed, returning true if the request
+    /// was handled internally and the caller should not immediately destroy
+    /// the runtime tab/window.
+    export fn ghostty_surface_request_close_deferred(ptr: *Surface) bool {
+        return ptr.core_surface.requestCloseDeferred();
+    }
+
+    /// Returns true if this surface is a tmux control mode pane.
+    export fn ghostty_surface_is_tmux(ptr: *Surface) bool {
+        const termio = @import("../termio.zig");
+        if (comptime termio.StreamHandler.tmux_enabled) {
+            return ptr.core_surface.io.backend == .tmux;
+        }
+        return false;
     }
 
     /// Request that the surface split in the given direction.
     export fn ghostty_surface_split(ptr: *Surface, direction: apprt.action.SplitDirection) void {
-        _ = ptr.app.performAction(
-            .{ .surface = &ptr.core_surface },
-            .new_split,
-            direction,
-        ) catch |err| {
+        _ = ptr.core_surface.performBindingAction(.{
+            .new_split = switch (direction) {
+                .right => .right,
+                .down => .down,
+                .left => .left,
+                .up => .up,
+            },
+        }) catch |err| {
             log.err("error creating new split err={}", .{err});
             return;
         };
