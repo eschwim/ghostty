@@ -1227,6 +1227,15 @@ pub const Viewer = struct {
                 });
             }
 
+            if (pane.current_command.len > 0) {
+                try actions.append(arena_alloc, .{
+                    .title = .{
+                        .pane_id = data.pane_id,
+                        .name = pane.current_command,
+                    },
+                });
+            }
+
             // Ensure the terminal is on the correct screen after
             // capture-pane processing (which may have switched to
             // alternate screen).

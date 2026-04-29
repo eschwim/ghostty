@@ -200,6 +200,10 @@ extension Ghostty {
         // by the user, this is set to the prior value (which may be empty, but non-nil).
         private var titleFromTerminal: String?
 
+        // Set by the split view drag gesture to distinguish split border
+        // drags from window resizes in sizeDidChange.
+        var isSplitDragging: Bool = false
+
         // The cached contents of the screen.
         private(set) var cachedScreenContents: CachedValue<String>
         private(set) var cachedVisibleContents: CachedValue<String>
@@ -445,8 +449,15 @@ extension Ghostty {
         private func setSurfaceSize(width: UInt32, height: UInt32) {
             guard let surface = self.surface else { return }
 
-            // Update our core surface
-            ghostty_surface_set_size(surface, width, height)
+            // Update our core surface. Use the split drag variant when
+            // the resize was triggered by dragging a split border, so
+            // the core can send resize-pane instead of refresh-client.
+            if isSplitDragging {
+                isSplitDragging = false
+                ghostty_surface_set_size_drag(surface, width, height)
+            } else {
+                ghostty_surface_set_size(surface, width, height)
+            }
 
             // Update our cached size metrics
             let size = ghostty_surface_size(surface)

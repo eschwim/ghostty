@@ -492,8 +492,14 @@ pub fn resize(
 
         // If the rendered terminal is different from our own (e.g.,
         // tmux pane terminal), resize it too under the same mutex.
+        // Tmux pane terminals are owned by the control-mode viewer and
+        // sized from tmux layout notifications; resizing them from the
+        // pane surface can blank alternate-screen applications after the
+        // viewer has already restored their content.
         if (self.renderer_state.terminal != &self.terminal) {
-            if (self.skip_next_rendered_resize) {
+            if (self.backend == .tmux) {
+                self.skip_next_rendered_resize = false;
+            } else if (self.skip_next_rendered_resize) {
                 self.skip_next_rendered_resize = false;
             } else {
                 self.renderer_state.terminal.resize(

@@ -245,17 +245,18 @@ class BaseTerminalController: NSWindowController,
         guard let ghostty_app = ghostty.app else { return nil }
         let newView = Ghostty.SurfaceView(ghostty_app, baseConfig: config)
 
+        // Read the pending split ratio (set by tmux layout sync, defaults to 0.5)
+        let ratio = ghostty_app_pending_split_ratio(ghostty_app)
+
         // Do the split
         let newTree: SplitTree<Ghostty.SurfaceView>
         do {
             newTree = try surfaceTree.inserting(
                 view: newView,
                 at: oldView,
-                direction: direction)
+                direction: direction,
+                ratio: ratio)
         } catch {
-            // If splitting fails for any reason (it should not), then we just log
-            // and return. The new view we created will be deinitialized and its
-            // no big deal.
             Ghostty.logger.warning("failed to insert split: \(error)")
             return nil
         }
@@ -882,6 +883,9 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func splitDidResize(node: SplitTree<Ghostty.SurfaceView>.Node, to newRatio: Double) {
+        for leaf in node.leaves() {
+            leaf.isSplitDragging = true
+        }
         let resizedNode = node.resizing(to: newRatio)
         do {
             surfaceTree = try surfaceTree.replacing(node: node, with: resizedNode)
